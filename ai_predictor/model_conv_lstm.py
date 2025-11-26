@@ -1,7 +1,3 @@
-# ai_predictor/model_conv_lstm.py
-
-from __future__ import annotations
-from typing import List, Tuple
 
 import torch
 import torch.nn as nn
@@ -9,23 +5,14 @@ import torch.nn as nn
 
 class ConvLSTMCell(nn.Module):
     """
-    Single ConvLSTM cell.
-
-    Input:
-        x_t: (B, C_in, H, W)
-        h_prev, c_prev: (B, C_hidden, H, W)
-    Output:
-        h_t, c_t
+    기본 ConvLSTM 셀.
+    입력:  (B, C_in, H, W)
+    hidden: (h, c) 각각 (B, C_hidden, H, W)
     """
 
-    def __init__(self,
-                 input_channels: int,
-                 hidden_channels: int,
-                 kernel_size: int = 3):
+    def __init__(self, input_channels, hidden_channels, kernel_size=3):
         super().__init__()
         padding = kernel_size // 2
-
-        self.input_channels = input_channels
         self.hidden_channels = hidden_channels
 
         self.conv = nn.Conv2d(
@@ -35,154 +22,78 @@ class ConvLSTMCell(nn.Module):
             padding=padding,
         )
 
-    def forward(
-        self,
-        x_t: torch.Tensor,
-        h_prev: torch.Tensor,
-        c_prev: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        combined = torch.cat([x_t, h_prev], dim=1)
-        conv_out = self.conv(combined)
+    def forward(self, x, state):
+        h, c = state  # (B, C_h, H, W)
+        combined = torch.cat([x, h], dim=1)  # (B, C_in + C_h, H, W)
+        gates = self.conv(combined)
+        (i, f, o, g) = torch.chunk(gates, 4, dim=1)
 
-        cc_i, cc_f, cc_o, cc_g = torch.chunk(conv_out, 4, dim=1)
+        i = torch.sigmoid(i)
+        f = torch.sigmoid(f)
+        o = torch.sigmoid(o)
+        g = torch.tanh(g)
 
-        i = torch.sigmoid(cc_i)
-        f = torch.sigmoid(cc_f)
-        o = torch.sigmoid(cc_o)
-        g = torch.tanh(cc_g)
+        c_next = f * c + i * g
+        h_next = o * torch.tanh(c_next)
+        return h_next, c_next
 
-        c_t = f * c_prev + i * g
-        h_t = o * torch.tanh(c_t)
-
-        return h_t, c_t
-
-    def init_hidden(self, batch_size: int, H: int, W: int, device) -> Tuple[torch.Tensor, torch.Tensor]:
+    def init_state(self, batch_size, spatial_size, device=None):
+        H, W = spatial_size
+        if device is None:
+            device = next(self.parameters()).device
         h = torch.zeros(batch_size, self.hidden_channels, H, W, device=device)
         c = torch.zeros(batch_size, self.hidden_channels, H, W, device=device)
         return h, c
 
 
-class ConvLSTMEncoder(nn.Module):
+class ConvLSTMPredictor(nn.Module):
     """
-    Multi-layer ConvLSTM encoder over T_in frames.
+    과거 T_in 프레임의 (oil + forcing field)를 입력으로 받아
+    다음 한 프레임의 oil 분포를 예측하는 기본 ConvLSTM 모델.
+
+    - input_channels: grid 당 채널 수
+        예: [oil, u_curr, v_curr, u_wind, v_wind, Hs, Tp, SST] 등
+    - hidden_channels: ConvLSTM hidden 크기
     """
 
-    def __init__(
-        self,
-        input_channels: int,
-        hidden_channels_list: List[int],
-        kernel_size: int = 3,
-    ):
+    def __init__(self, input_channels, hidden_channels=32, num_layers=2):
         super().__init__()
+        self.num_layers = num_layers
 
-        layers = []
-        prev_channels = input_channels
-        for hidden_channels in hidden_channels_list:
-            layers.append(
-                ConvLSTMCell(
-                    input_channels=prev_channels,
-                    hidden_channels=hidden_channels,
-                    kernel_size=kernel_size,
-                )
-            )
-            prev_channels = hidden_channels
+        cells = []
+        for layer_idx in range(num_layers):
+            in_ch = input_channels if layer_idx == 0 else hidden_channels
+            cells.append(ConvLSTMCell(in_ch, hidden_channels))
+        self.cells = nn.ModuleList(cells)
 
-        self.layers = nn.ModuleList(layers)
+        # 마지막 hidden → oil 예측 채널 (1채널 가정: oil thickness/conc)
+        self.out_conv = nn.Conv2d(hidden_channels, 1, kernel_size=1)
 
-    def forward(self, x: torch.Tensor) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+    def forward(self, x_seq):
         """
-        x: (B, T_in, C_in, H, W)
-        Returns:
-            h_list: [h_T^layer0, h_T^layer1, ...]
-            c_list: [c_T^layer0, c_T^layer1, ...]
+        x_seq: (B, T_in, C_in, H, W)
+        출력:  (B, 1, H, W)  (다음 시간의 oil 분포)
         """
-        B, T_in, C, H, W = x.shape
-        device = x.device
+        B, T, C, H, W = x_seq.shape
+        device = x_seq.device
 
-        # initialize states
-        hs = []
-        cs = []
-        for layer in self.layers:
-            h0, c0 = layer.init_hidden(B, H, W, device)
-            hs.append(h0)
-            cs.append(c0)
+        # layer별 hidden state 초기화
+        states = []
+        for cell in self.cells:
+            states.append(cell.init_state(B, (H, W), device=device))
 
-        # iterate over time
-        for t in range(T_in):
-            x_t = x[:, t]  # (B, C_in, H, W)
-            for li, layer in enumerate(self.layers):
-                h_prev, c_prev = hs[li], cs[li]
-                h_t, c_t = layer(x_t, h_prev, c_prev)
-                hs[li], cs[li] = h_t, c_t
-                x_t = h_t  # input for next layer
+        # 시간 순회
+        for t in range(T):
+            xt = x_seq[:, t]  # (B, C, H, W)
+            for layer_idx, cell in enumerate(self.cells):
+                h, c = states[layer_idx]
+                h, c = cell(xt, (h, c))
+                states[layer_idx] = (h, c)
+                xt = h  # 다음 layer 입력
 
-        h_list = [h for h in hs]
-        c_list = [c for c in cs]
-
-        return h_list, c_list
-
-
-class OilSpillPredictor(nn.Module):
-    """
-    ConvLSTM-based multi-step predictor.
-
-    - Encode past T_in frames with multi-layer ConvLSTM
-    - Decode T_out future frames using a single ConvLSTMCell
-      on top of the last-layer hidden state.
-    """
-
-    def __init__(
-        self,
-        in_channels: int = 3,
-        hidden_channels_list: List[int] = [32, 32],
-        kernel_size: int = 3,
-        t_out: int = 5,
-    ):
-        super().__init__()
-        self.t_out = t_out
-
-        self.encoder = ConvLSTMEncoder(
-            input_channels=in_channels,
-            hidden_channels_list=hidden_channels_list,
-            kernel_size=kernel_size,
-        )
-
-        last_hidden = hidden_channels_list[-1]
-        # Decoder cell that evolves hidden state in time (no external forcing for now)
-        self.decoder_cell = ConvLSTMCell(
-            input_channels=last_hidden,  # we feed previous h as x
-            hidden_channels=last_hidden,
-            kernel_size=kernel_size,
-        )
-
-        self.out_conv = nn.Conv2d(
-            in_channels=last_hidden,
-            out_channels=1,  # predict oil channel
-            kernel_size=1,
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: (B, T_in, C_in, H, W)
-
-        Returns:
-            y_pred: (B, T_out, 1, H, W)
-        """
-        B, T_in, C, H, W = x.shape
-        device = x.device
-
-        h_list, c_list = self.encoder(x)
-        # Use only the last layer hidden state as starting point for decoder
-        h_t = h_list[-1]
-        c_t = c_list[-1]
-
-        preds = []
-        for _ in range(self.t_out):
-            # Use previous hidden as input to decoder cell
-            h_t, c_t = self.decoder_cell(h_t, h_t, c_t)
-            y_t = self.out_conv(h_t)
-            preds.append(y_t)
-
-        y_pred = torch.stack(preds, dim=1)  # (B, T_out, 1, H, W)
-        return y_pred
+        # 마지막 layer hidden → output
+        h_last, _ = states[-1]
+        out = self.out_conv(h_last)
+        # 음수 유막은 없으니 ReLU or clamp
+        out = torch.clamp(out, min=0.0)
+        return out
