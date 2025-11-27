@@ -10,3 +10,6 @@ requests
 opencv-python
 plotly
 dash
+streamlit
+plotly
+fpdf
