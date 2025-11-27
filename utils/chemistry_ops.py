@@ -2,14 +2,26 @@ import numpy as np
 
 """
 Chemistry-related mini models for oil spill:
-- UV/fluorescence → concentration 변환
-- TOC 기반 오염 등급 판단
-- 화학적 분해(산화/가수분해 등) 속도식
-- 분산제(또는 화학 처리제) 효과 반영
+- UV/fluorescence -> concentration conversion
+- TOC based contamination level
+- Chemical decay (weathering, photolysis)
+- Dispersant effectiveness
+- Toxicity Threshold Checks
+
+Scientific parameters derived from literature (see doc/bio_chem_params.md).
 """
 
+# --- Scientific Constants ---
+# Phytoplankton Inhibition Threshold: > 100 mg/L (severe)
+PHYTO_INHIB_THRESHOLD = 100.0 
 
-# --------- 1. UV / fluorescence → 농도 변환 --------- #
+# General Chemical Decay (Weathering) Rate: ~0.01 - 0.05 day^-1 (slow without bio)
+# Photolysis can be faster but depth-limited.
+DAYS_TO_SECONDS = 86400.0
+K_CHEM_DEFAULT = 0.02 / DAYS_TO_SECONDS
+
+
+# --------- 1. UV / fluorescence -> Concentration Conversion --------- #
 
 def uv_to_concentration_linear(intensity, a, b):
     """
@@ -19,7 +31,7 @@ def uv_to_concentration_linear(intensity, a, b):
         Measured UV / fluorescence intensity.
     a, b : float
         Calibration coefficients from experiments / papers.
-        (예: 논문에서 y = a x + b 형태로 제시된 값)
+        (e.g., y = a x + b)
 
     Returns
     -------
@@ -31,7 +43,7 @@ def uv_to_concentration_linear(intensity, a, b):
 
 def uv_to_concentration_poly(intensity, coeffs):
     """
-    Polynomial calibration curve (비선형 보정이 필요할 때).
+    Polynomial calibration curve (for non-linear response).
 
     intensity : np.ndarray or float
     coeffs : list or np.ndarray
@@ -46,7 +58,7 @@ def uv_to_concentration_poly(intensity, coeffs):
     return np.polyval(coeffs[::-1], intensity)
 
 
-# --------- 2. TOC 기반 오염 등급 --------- #
+# --------- 2. TOC Based Contamination Level --------- #
 
 def classify_toc(toc_value, threshold_moderate, threshold_high):
     """
@@ -57,7 +69,7 @@ def classify_toc(toc_value, threshold_moderate, threshold_high):
     toc_value : float or np.ndarray
         TOC value [mg/L].
     threshold_moderate : float
-        Lower threshold (e.g. 'significant contamination' 시작점).
+        Lower threshold (e.g. 'significant contamination' start).
     threshold_high : float
         High contamination threshold.
 
@@ -75,29 +87,32 @@ def classify_toc(toc_value, threshold_moderate, threshold_high):
     return level
 
 
-# --------- 3. 화학적 분해 / 소실 속도 --------- #
+# --------- 3. Chemical Decay / Weathering --------- #
 
-def apply_chemical_decay(conc, k_chem, dt):
+def apply_chemical_decay(conc, k_chem=None, dt=3600.0):
     """
-    First-order chemical degradation (photo-oxidation, dissolution 등).
+    First-order chemical degradation (photo-oxidation, dissolution, etc.).
 
-    dC/dt = -k_chem * C  →  C(t+dt) = C(t) * exp(-k_chem * dt)
+    dC/dt = -k_chem * C  ->  C(t+dt) = C(t) * exp(-k_chem * dt)
 
     Parameters
     ----------
     conc : np.ndarray
-        Current oil concentration (water column 또는 surface film).
-    k_chem : float
-        First-order decay constant [1/time].
-        (논문에서 half-life, rate constant 등으로 추정)
+        Current oil concentration (water column or surface film).
+    k_chem : float, optional
+        First-order decay constant [1/s].
+        If None, uses K_CHEM_DEFAULT.
     dt : float
-        Time step.
+        Time step [s].
 
     Returns
     -------
     conc_new : np.ndarray
         Updated concentration after chemical decay.
     """
+    if k_chem is None:
+        k_chem = K_CHEM_DEFAULT
+        
     return conc * np.exp(-k_chem * dt)
 
 
@@ -109,8 +124,8 @@ def apply_multiphase_decay(conc_dissolved, conc_droplet, k_dissolved, k_droplet,
     ----------
     conc_dissolved : np.ndarray
     conc_droplet   : np.ndarray
-    k_dissolved    : float  (용존 상태 분해율)
-    k_droplet      : float  (방울/유제 상태 분해율)
+    k_dissolved    : float  (Dissolved phase decay rate)
+    k_droplet      : float  (Droplet/Emulsion decay rate)
     dt             : float
 
     Returns
@@ -122,18 +137,18 @@ def apply_multiphase_decay(conc_dissolved, conc_droplet, k_dissolved, k_droplet,
     return cd_new, cp_new
 
 
-# --------- 4. 분산제 / 화학 처리 효과 --------- #
+# --------- 4. Dispersant / Chemical Treatment Effect --------- #
 
 def apply_dispersant_effect(surface_conc, dispersant_dose, efficiency):
     """
-    Simple model: 일부 표면유가 분산되어 물속으로 이동.
+    Simple model: Fraction of surface oil dispersed into water column.
 
     Parameters
     ----------
     surface_conc : np.ndarray
         Surface oil concentration (e.g. g/m^2).
     dispersant_dose : float
-        Normalized dose (0~1 범위로 scaling해서 사용 권장).
+        Normalized dose (0~1 recommended scaling).
     efficiency : float
         Fraction of surface oil removed per unit dose (0~1).
 
@@ -142,10 +157,44 @@ def apply_dispersant_effect(surface_conc, dispersant_dose, efficiency):
     surface_new : np.ndarray
         Reduced surface concentration.
     dispersed_amount : np.ndarray
-        Amount moved to subsurface/droplet phase (필요시 biology 모델과 연결).
+        Amount moved to subsurface/droplet phase.
     """
-    # 실제로는 non-linear response일 수 있지만 1차 근사로 둠
+    # Linear approximation clipped at 100% removal
     removal_frac = np.clip(dispersant_dose * efficiency, 0.0, 1.0)
     dispersed_amount = surface_conc * removal_frac
     surface_new = surface_conc - dispersed_amount
     return surface_new, dispersed_amount
+
+
+# --------- 5. Toxicity Assessment (New) --------- #
+
+def check_toxicity_thresholds(oil_conc, thresholds=None):
+    """
+    Check if oil concentration exceeds specific toxicity thresholds.
+    
+    Parameters
+    ----------
+    oil_conc : np.ndarray
+        Oil concentration [mg/L]
+    thresholds : dict, optional
+        Dictionary of thresholds. Default:
+        {'phyto_inhibit': 100.0, 'zoo_lc50': 30.0}
+        
+    Returns
+    -------
+    flags : dict of np.ndarray (bool)
+        Keys matching thresholds, values are boolean masks where limit is exceeded.
+    """
+    if thresholds is None:
+        thresholds = {
+            'phyto_inhibit': PHYTO_INHIB_THRESHOLD,
+            'zoo_lc50': 30.0  # Consistent with biology_ops default
+        }
+        
+    flags = {}
+    oil_conc = np.asarray(oil_conc)
+    
+    for key, val in thresholds.items():
+        flags[key] = (oil_conc >= val)
+        
+    return flags
