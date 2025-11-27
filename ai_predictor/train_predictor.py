@@ -1,111 +1,109 @@
 # ai_predictor/train_predictor.py
 
 from __future__ import annotations
+
 import os
 import time
 
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
+from torch.utils.data import DataLoader
 
-from ai_predictor.dataset import build_dataloaders, T_IN, T_OUT
-from ai_predictor.model_conv_lstm import OilSpillPredictor
+from ai_predictor.dataset import get_cmems_dataset
+from ai_predictor.model_conv_lstm import ConvLSTMForecaster
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+# ===== 하이퍼파라미터 / 경로 설정 =====
+NPZ_PATH = "data/processed/cmems_sequences.npz"
 
-EPOCHS = 20
 BATCH_SIZE = 4
+EPOCHS = 20
 LR = 1e-3
 
-
-def train_epoch(model, loader, criterion, optimizer):
-    model.train()
-    total_loss = 0.0
-    for X, y in loader:
-        X = X.to(DEVICE)  # (B, T_IN, C, H, W)
-        y = y.to(DEVICE)  # (B, T_OUT, 1, H, W)
-
-        optimizer.zero_grad()
-        y_pred = model(X)
-        loss = criterion(y_pred, y)
-        loss.backward()
-        optimizer.step()
-
-        total_loss += loss.item() * X.size(0)
-
-    return total_loss / len(loader.dataset)
+INPUT_LEN = 14      # x에서 사용할 시계열 길이
+TARGET_LEN = 1      # y에서 예측할 프레임 수 (현재 모델은 1프레임용)
+VAL_RATIO = 0.2
 
 
-def eval_epoch(model, loader, criterion):
-    model.eval()
-    total_loss = 0.0
-    with torch.no_grad():
-        for X, y in loader:
-            X = X.to(DEVICE)
-            y = y.to(DEVICE)
-            y_pred = model(X)
-            loss = criterion(y_pred, y)
-            total_loss += loss.item() * X.size(0)
-    return total_loss / len(loader.dataset)
+def main() -> None:
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[INFO] Device: {device}")
 
-
-def main():
-    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    npz_path = os.path.join(base_dir, "data", "processed", "train_sequences.npz")
-
-    if not os.path.isfile(npz_path):
-        raise FileNotFoundError(
-            f"Training data not found at {npz_path}. "
-            f"Run data/make_synthetic_data.py first."
-        )
-
-    train_loader, val_loader, test_loader = build_dataloaders(
-        npz_path, batch_size=BATCH_SIZE, t_in=T_IN, t_out=T_OUT
+    # ----- 데이터 로더 준비 -----
+    train_loader, val_loader = get_cmems_dataset(
+        npz_path=NPZ_PATH,
+        batch_size=BATCH_SIZE,
+        input_len=INPUT_LEN,
+        target_len=TARGET_LEN,
+        val_ratio=VAL_RATIO,
     )
+    print("[DEBUG] train/val DataLoader 생성 완료")
 
-    model = OilSpillPredictor(in_channels=3, t_out=T_OUT).to(DEVICE)
+    # ----- 모델 생성 -----
+    model = ConvLSTMForecaster(
+        in_channels=3,
+        hidden_channels=[32, 32],
+        kernel_size=3,
+        input_len=INPUT_LEN,
+        target_len=TARGET_LEN,
+        out_channels=1,
+    ).to(device)
+
     criterion = nn.MSELoss()
     optimizer = AdamW(model.parameters(), lr=LR)
 
-    ckpt_dir = os.path.join(base_dir, "ai_predictor", "checkpoints")
-    os.makedirs(ckpt_dir, exist_ok=True)
-    best_ckpt_path = os.path.join(ckpt_dir, "predictor_best.pt")
-
+    # ----- 학습 루프 -----
     best_val_loss = float("inf")
-
-    print(f"[INFO] Device: {DEVICE}")
-    print(f"[INFO] Training for {EPOCHS} epochs...")
-
     for epoch in range(1, EPOCHS + 1):
         t0 = time.time()
-        train_loss = train_epoch(model, train_loader, criterion, optimizer)
-        val_loss = eval_epoch(model, val_loader, criterion)
-        dt = time.time() - t0
+        model.train()
+        train_loss_sum = 0.0
+        n_train_batch = 0
+
+        for x, y in train_loader:  # x: (B, T_in, C, H, W), y: (B, 1, 1, H, W)
+            x = x.to(device)
+            y = y.to(device)
+
+            optimizer.zero_grad()
+            y_pred = model(x)  # (B, 1, 1, H, W)
+
+            loss = criterion(y_pred, y)
+            loss.backward()
+            optimizer.step()
+
+            train_loss_sum += loss.item()
+            n_train_batch += 1
+
+        train_loss = train_loss_sum / max(1, n_train_batch)
+
+        # ----- 검증 -----
+        model.eval()
+        val_loss_sum = 0.0
+        n_val_batch = 0
+        with torch.inference_mode():
+            for x, y in val_loader:
+                x = x.to(device)
+                y = y.to(device)
+                y_pred = model(x)
+                loss = criterion(y_pred, y)
+                val_loss_sum += loss.item()
+                n_val_batch += 1
+
+        val_loss = val_loss_sum / max(1, n_val_batch)
+        elapsed = time.time() - t0
 
         print(
-            f"[Epoch {epoch:03d}] "
-            f"train_loss={train_loss:.6f}, val_loss={val_loss:.6f} "
-            f"({dt:.1f}s)"
+            f"[Epoch {epoch:02d}/{EPOCHS}] "
+            f"train_loss={train_loss:.4e}, "
+            f"val_loss={val_loss:.4e}, "
+            f"time={elapsed:.1f}s"
         )
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            torch.save(
-                {
-                    "model_state_dict": model.state_dict(),
-                    "epoch": epoch,
-                    "val_loss": val_loss,
-                    "config": {
-                        "T_IN": T_IN,
-                        "T_OUT": T_OUT,
-                    },
-                },
-                best_ckpt_path,
-            )
-            print(f"    [INFO] New best model saved to {best_ckpt_path}")
 
-    test_loss = eval_epoch(model, test_loader, criterion)
-    print(f"[INFO] Final test_loss={test_loss:.6f}")
+    print("[INFO] Training finished")
+    print(f"[INFO] Best val_loss = {best_val_loss:.4e}")
 
 
 if __name__ == "__main__":
