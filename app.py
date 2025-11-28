@@ -21,6 +21,7 @@ from data.make_synthetic_data import generate_synthetic_dataset
 from ai_predictor.model_conv_lstm import ConvLSTMPredictor
 from utils.biology_ops import update_DO, plankton_response, ecological_recovery_index
 from utils.chemistry_ops import check_toxicity_thresholds
+from utils.metrics import calculate_metrics
 
 # Page Config
 st.set_page_config(
@@ -114,7 +115,7 @@ with st.sidebar.expander("1. Physics & Data Generation", expanded=True):
     t_total = st.slider("Time Steps per Sequence", 10, 30, 15)
 
 with st.sidebar.expander("2. AI Model Training", expanded=True):
-    num_epochs = st.slider("Training Epochs", 1, 50, 5)
+    num_epochs = st.slider("Training Epochs", 1, 50, 10)
     learning_rate = st.select_slider("Learning Rate", options=[1e-4, 5e-4, 1e-3, 5e-3], value=1e-3)
 
 with st.sidebar.expander("3. Biology & Chemistry", expanded=True):
@@ -296,6 +297,10 @@ if st.sidebar.button("🚀 RUN SIMULATION"):
         Benthos_curr, Benthos_ref
     )
     
+    # 5. Accuracy Metrics
+    # Compare pred_oil (AI) with true_future (Physics)
+    acc_metrics = calculate_metrics(true_future, pred_oil)
+    
     # --- REPORTING METRICS ---
     max_oil_idx = np.unravel_index(np.argmax(pred_oil, axis=None), pred_oil.shape)
     most_impacted_zone = f"({max_oil_idx[1]}, {max_oil_idx[0]})" # (x, y)
@@ -323,12 +328,16 @@ if st.sidebar.button("🚀 RUN SIMULATION"):
 - **Min Dissolved Oxygen:** {min_do:.2f} mg/L
 - **Most Impacted Zone:** {most_impacted_zone}
 
-#### 3. Analysis Summary
+#### 3. Prediction Accuracy (AI vs Physics)
+- **SSIM (Structural Similarity):** {acc_metrics['SSIM']:.4f} (1.0 = Perfect Match)
+- **MSE (Mean Squared Error):** {acc_metrics['MSE']:.6f}
+- **PSNR (Peak Signal-to-Noise):** {acc_metrics['PSNR']:.2f} dB
+
+#### 4. Analysis Summary
 The simulation predicts a maximum oil concentration of **{pred_oil.max():.4f}**. 
 The ecological recovery index indicates the overall health of the ecosystem is at **{avg_recovery:.2f}**.
     """
 
-    # --- SAVE PLOTS FOR PDF ---
     temp_dir = "temp_reports"
     os.makedirs(temp_dir, exist_ok=True)
     
@@ -388,9 +397,17 @@ The ecological recovery index indicates the overall health of the ecosystem is a
     pdf.cell(0, 10, f"Min Dissolved Oxygen: {min_do:.2f} mg/L", 0, 1)
     pdf.cell(0, 10, f"Most Impacted Zone: {most_impacted_zone}", 0, 1)
     pdf.ln(5)
+
+    pdf.set_font("Arial", 'B', 14)
+    pdf.cell(0, 10, "3. Prediction Accuracy", 0, 1)
+    pdf.set_font("Arial", size=12)
+    pdf.cell(0, 10, f"SSIM: {acc_metrics['SSIM']:.4f}", 0, 1)
+    pdf.cell(0, 10, f"MSE: {acc_metrics['MSE']:.6f}", 0, 1)
+    pdf.cell(0, 10, f"PSNR: {acc_metrics['PSNR']:.2f} dB", 0, 1)
+    pdf.ln(5)
     
     pdf.set_font("Arial", 'B', 14)
-    pdf.cell(0, 10, "3. Analysis Summary", 0, 1)
+    pdf.cell(0, 10, "4. Analysis Summary", 0, 1)
     pdf.set_font("Arial", size=12)
     pdf.multi_cell(0, 10, f"The simulation predicts a maximum oil concentration of {pred_oil.max():.4f}. The ecological recovery index indicates the overall health of the ecosystem is at {avg_recovery:.2f}.")
     pdf.ln(10)
@@ -398,7 +415,7 @@ The ecological recovery index indicates the overall health of the ecosystem is a
     # Images Section
     pdf.add_page()
     pdf.set_font("Arial", 'B', 14)
-    pdf.cell(0, 10, "4. Visual Maps", 0, 1)
+    pdf.cell(0, 10, "5. Visual Maps", 0, 1)
     
     # Layout: 2 images per page
     y_start = pdf.get_y()
@@ -444,6 +461,16 @@ The ecological recovery index indicates the overall health of the ecosystem is a
         st.caption(f"Toxic Area: {toxic_area_percent:.1f}%")
     with col4:
         st.metric("Recovery Index", f"{avg_recovery:.3f}", delta_color="normal" if avg_recovery > 0.8 else "inverse")
+
+    # Accuracy Metrics Row
+    st.markdown("##### 🎯 Model Accuracy")
+    col_a1, col_a2, col_a3 = st.columns(3)
+    with col_a1:
+        st.metric("SSIM (Similarity)", f"{acc_metrics['SSIM']:.4f}", help="Structural Similarity Index (1.0 is perfect)")
+    with col_a2:
+        st.metric("MSE (Error)", f"{acc_metrics['MSE']:.6f}", help="Mean Squared Error (Lower is better)")
+    with col_a3:
+        st.metric("PSNR", f"{acc_metrics['PSNR']:.2f} dB", help="Peak Signal-to-Noise Ratio (Higher is better)")
         
     # Download Report Button
     st.download_button(
@@ -525,7 +552,9 @@ The ecological recovery index indicates the overall health of the ecosystem is a
         "k_consume": k_consume,
         "Max Oil": max_oil,
         "Avg DO": avg_do,
+        "Avg DO": avg_do,
         "Recovery Idx": avg_recovery,
+        "SSIM": acc_metrics['SSIM'],
         # Store figure data objects or the data itself to re-plot
         "plot_data": {
             "input_img": input_img,
@@ -555,6 +584,8 @@ if 'selected_run' in st.session_state and st.session_state.selected_run:
         st.metric("Recovery Index", f"{entry['Recovery Idx']:.3f}")
     with col4:
         st.caption(f"Params: Epochs={entry['Epochs']}, LR={entry['LR']}, k={entry['k_consume']}")
+        if 'SSIM' in entry:
+            st.caption(f"SSIM: {entry['SSIM']:.4f}")
 
     # Plots
     pdata = entry['plot_data']
