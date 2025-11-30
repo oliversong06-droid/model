@@ -1,0 +1,3 @@
+import numpy as np
+d = np.load("data/processed/cmems_sequences.npz")
+print(d.files)

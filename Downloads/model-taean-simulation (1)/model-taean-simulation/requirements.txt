@@ -1,0 +1,15 @@
+numpy
+pandas
+matplotlib
+xarray
+torch
+tensorflow
+scikit-learn
+netCDF4
+requests
+opencv-python
+plotly
+dash
+streamlit
+plotly
+fpdf

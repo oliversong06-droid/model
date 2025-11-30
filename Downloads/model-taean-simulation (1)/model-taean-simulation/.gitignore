@@ -1,0 +1,9 @@
+# .gitignore 파일 내용
+__pycache__/
+*.nc
+*.npz
+*.npy
+*.pth
+*.DS_Store
+data/processed/
+checkpoints/
